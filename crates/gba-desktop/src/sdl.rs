@@ -95,7 +95,11 @@ const SDL_EVENT_FINGER_DOWN: u32 = 0x700;
 const SDL_EVENT_FINGER_UP: u32 = 0x701;
 const SDL_EVENT_FINGER_MOTION: u32 = 0x702;
 const SDL_EVENT_FINGER_CANCELED: u32 = 0x703;
-const SDL_TOUCH_DEVICE_DIRECT: c_int = 1;
+// SDL_TouchDeviceType starts at -1 (`SDL_TOUCH_DEVICE_INVALID`), so `DIRECT`
+// is 0 and `INDIRECT_ABSOLUTE` is 1. Comparing against 1 asked whether the
+// device was a trackpad, which is why a phone reported no touch screen until
+// after the first finger event had already been seen.
+const SDL_TOUCH_DEVICE_DIRECT: c_int = 0;
 const SDL_EVENT_GAMEPAD_BUTTON_DOWN: u32 = 0x651;
 const SDL_LOGICAL_PRESENTATION_LETTERBOX: c_int = 2;
 const SDL_SCALEMODE_LINEAR: c_int = 1;
@@ -205,6 +209,7 @@ unsafe extern "C" {
     fn SDL_SetRenderVSync(renderer: *mut SdlRenderer, vsync: c_int) -> bool;
     fn SDL_SetRenderDrawBlendMode(renderer: *mut SdlRenderer, mode: u32) -> bool;
     fn SDL_RenderFillRect(renderer: *mut SdlRenderer, rect: *const FRect) -> bool;
+    fn SDL_RenderRect(renderer: *mut SdlRenderer, rect: *const FRect) -> bool;
     fn SDL_RenderDebugText(renderer: *mut SdlRenderer, x: f32, y: f32, text: *const c_char)
     -> bool;
 
@@ -280,6 +285,15 @@ impl Drop for Surface {
     }
 }
 
+/// Android delivers the back button as a QUIT event unless it is trapped.
+/// Trapping turns it into [`scancode::AC_BACK`], which the frontend uses to
+/// open the menu — on a phone that is the only way to reach it.
+pub fn android_back_button_hint() {
+    if cfg!(target_os = "android") {
+        set_hint("SDL_ANDROID_TRAP_BACK_BUTTON", "1");
+    }
+}
+
 /// Set an SDL hint before initialisation.
 pub fn set_hint(name: &str, value: &str) {
     if let (Ok(n), Ok(v)) = (CString::new(name), CString::new(value)) {
@@ -308,6 +322,34 @@ pub fn pref_path() -> Option<std::path::PathBuf> {
         let path = CStr::from_ptr(p).to_string_lossy().into_owned();
         SDL_free(p.cast());
         Some(std::path::PathBuf::from(path))
+    }
+}
+
+/// Android has no console: `stderr` from the runtime goes nowhere, so a
+/// package that fails on device is silently broken (KNO-009). Forward a
+/// diagnostic to logcat under the `gba-recomp` tag, which is where
+/// `SDL_Log` itself writes.
+///
+/// `ANDROID_LOG_INFO` is 4 and the priority is a C `int`; the message is
+/// passed as `%s` so a `%` inside a diagnostic can never be read as a format
+/// directive. `__android_log_print` truncates long messages to just under
+/// 4 KiB per call, which is far more than the frontend emits.
+#[cfg(target_os = "android")]
+pub fn log_to_system(message: &str) {
+    const ANDROID_LOG_INFO: c_int = 4;
+    unsafe extern "C" {
+        fn __android_log_print(prio: c_int, tag: *const c_char, fmt: *const c_char, ...) -> c_int;
+    }
+    // SAFETY: static C strings plus one NUL-terminated copy of `message`.
+    if let Ok(text) = CString::new(message) {
+        unsafe {
+            __android_log_print(
+                ANDROID_LOG_INFO,
+                c"gba-recomp".as_ptr(),
+                c"%s".as_ptr(),
+                text.as_ptr(),
+            );
+        }
     }
 }
 
@@ -347,6 +389,10 @@ fn last_error(what: &str) -> String {
 pub mod scancode {
     pub const A: usize = 4;
     pub const F1: usize = 58;
+    /// Android back button. Only delivered once
+    /// `SDL_ANDROID_TRAP_BACK_BUTTON` is set; otherwise SDL turns it into a
+    /// QUIT event and the app closes.
+    pub const AC_BACK: usize = 282;
     pub const F11: usize = 68;
     pub const SPACE: usize = 44;
     pub const S: usize = 22;
@@ -399,6 +445,14 @@ pub enum Event {
         x: f32,
         y: f32,
     },
+    /// Finger moved while down. Separate from [`Event::FingerDown`] so press
+    /// duration and travel can be measured (a long press opens the menu; a
+    /// drag cancels it).
+    FingerMotion {
+        finger: u64,
+        x: f32,
+        y: f32,
+    },
     FingerUp {
         finger: u64,
     },
@@ -429,6 +483,9 @@ pub enum Event {
 impl Context {
     /// Initialises video, events and gamepads (required).
     pub fn init() -> Result<Self, String> {
+        // Before SDL_Init: on Android the hint has to be in place or the
+        // back button arrives as QUIT and closes the app.
+        android_back_button_hint();
         // SAFETY: plain FFI call with constant flags.
         if unsafe {
             SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK)
@@ -556,9 +613,19 @@ impl Context {
                 button: ev.bytes[24],
             },
             // SDL_TouchFingerEvent: fingerID at 24, x/y floats at 32/36.
-            SDL_EVENT_FINGER_DOWN | SDL_EVENT_FINGER_MOTION => {
+            // Down and motion are kept apart: the menu opens on a long press,
+            // which has to be cancellable when the finger travels.
+            SDL_EVENT_FINGER_DOWN => {
                 let f = |at: usize| f32::from_ne_bytes(ev.bytes[at..at + 4].try_into().unwrap());
                 Event::FingerDown {
+                    finger: u64::from_ne_bytes(ev.bytes[24..32].try_into().unwrap()),
+                    x: f(32),
+                    y: f(36),
+                }
+            }
+            SDL_EVENT_FINGER_MOTION => {
+                let f = |at: usize| f32::from_ne_bytes(ev.bytes[at..at + 4].try_into().unwrap());
+                Event::FingerMotion {
                     finger: u64::from_ne_bytes(ev.bytes[24..32].try_into().unwrap()),
                     x: f(32),
                     y: f(36),
@@ -918,6 +985,19 @@ impl Painter<'_> {
             SDL_SetRenderDrawBlendMode(self.renderer.as_ptr(), SDL_BLENDMODE_BLEND);
             SDL_SetRenderDrawColor(self.renderer.as_ptr(), rgba[0], rgba[1], rgba[2], rgba[3]);
             SDL_RenderFillRect(self.renderer.as_ptr(), &rect);
+        }
+    }
+
+    /// One-pixel rectangle outline; the fill of the same area is [`fill`].
+    ///
+    /// [`fill`]: Painter::fill
+    pub fn outline(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: [u8; 4]) {
+        let rect = FRect { x, y, w, h };
+        // SAFETY: renderer is live; `rect` outlives the call.
+        unsafe {
+            SDL_SetRenderDrawBlendMode(self.renderer.as_ptr(), SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(self.renderer.as_ptr(), rgba[0], rgba[1], rgba[2], rgba[3]);
+            SDL_RenderRect(self.renderer.as_ptr(), &rect);
         }
     }
 

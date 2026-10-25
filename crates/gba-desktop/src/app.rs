@@ -322,6 +322,30 @@ enum Effect {
     Quit,
 }
 
+/// Whether a key press may be recorded as a game binding during a keyboard
+/// remap. Esc and the Android back button only cancel — capturing the back
+/// button would make the menu unreachable on a phone.
+fn captures_key(sc: usize) -> bool {
+    !matches!(sc, scancode::ESCAPE | scancode::AC_BACK)
+}
+
+/// Whether a key opens the menu when it is closed: Esc/F1 on desktop, the
+/// Android back button on touch devices.
+fn opens_menu(sc: usize) -> bool {
+    matches!(sc, scancode::ESCAPE | scancode::F1 | scancode::AC_BACK)
+}
+
+/// Whether the virtual touch pad is active: drawn over the game and, with the
+/// menu open, the navigation device (SPEC-068 TOUCH-68-02). `off` takes the
+/// pad away and with it all touch navigation; `auto` follows the hardware.
+fn touch_controls_visible(mode: TouchMode, has_touchscreen: bool, touch_seen: bool) -> bool {
+    match mode {
+        TouchMode::On => true,
+        TouchMode::Off => false,
+        TouchMode::Auto => has_touchscreen || touch_seen,
+    }
+}
+
 fn context_effect(id: u32, s: &Settings) -> Effect {
     let mut n = s.clone();
     match id {
@@ -415,7 +439,7 @@ pub fn run_app(
     let mut settings_invalid_on_disk = loaded.invalid_on_disk;
     let mut current = loaded.settings;
     let mut status: Option<(String, Instant)> = loaded.warning.map(|w| {
-        eprintln!("gba-desktop: {w}");
+        crate::diag::warn_prefixed(&w);
         (
             "Configuracoes invalidas: usando padroes".to_owned(),
             Instant::now(),
@@ -429,7 +453,7 @@ pub fn run_app(
     let mut audio = match ctx.open_audio(AUDIO_HZ) {
         Ok(a) => Some(a),
         Err(e) => {
-            eprintln!("gba-desktop: audio disabled ({e}); continuing without sound");
+            crate::diag::warn_prefixed(&format!("audio disabled ({e}); continuing without sound"));
             None
         }
     };
@@ -437,7 +461,12 @@ pub fn run_app(
     let mut joys: Vec<sdl::Joystick<'_>> = Vec::new();
     let mut gpio: Option<GpioInput> = None;
     // Touch screens (SPEC-068 TOUCH-68-01): active fingers in logical coords.
-    let mut fingers: std::collections::HashMap<u64, (f32, f32)> = Default::default();
+    let mut fingers = touch::Fingers::default();
+    // A long press on free screen area opens the menu: on a phone there is
+    // no Esc, no right click and no menu bar.
+    let mut long_press = touch::LongPress::new();
+    // Touch navigation for the open menu (SPEC-068 TOUCH-68-02).
+    let mut nav_pad = touch::NavPad::new();
     let has_touchscreen = ctx.has_touchscreen();
     let mut touch_seen = false;
 
@@ -472,12 +501,12 @@ pub fn run_app(
             *gpio = None;
             match GpioInput::open(&s.gpio) {
                 Ok(g) => *gpio = g,
-                Err(e) => eprintln!("gba-desktop: GPIO disabled ({e})"),
+                Err(e) => crate::diag::warn_prefixed(&format!("GPIO disabled ({e})")),
             }
         }
         let (b, warnings) = resolve(&s.input);
         for w in warnings {
-            eprintln!("gba-desktop: {w}");
+            crate::diag::warn_prefixed(&w);
         }
         *bindings = b;
         applied = Some(s.clone());
@@ -485,7 +514,7 @@ pub fn run_app(
     // Branding (FR-63-03): window/Dock icon and a 2.4 s logo splash.
     match sdl::Surface::from_png(crate::assets::ICON_PNG) {
         Ok(icon) => video.set_icon(&icon),
-        Err(e) => eprintln!("gba-desktop: icon unavailable ({e})"),
+        Err(e) => crate::diag::warn_prefixed(&format!("icon unavailable ({e})")),
     }
     apply(
         &current,
@@ -514,7 +543,7 @@ pub fn run_app(
                 None
             }
             Err(e) => {
-                eprintln!("gba-desktop: {e}");
+                crate::diag::warn_prefixed(&e);
                 Some("Nao foi possivel salvar as configuracoes".into())
             }
         }
@@ -543,7 +572,7 @@ pub fn run_app(
                     return Ok(AppReport::default());
                 }
             }
-            Err(e) => eprintln!("gba-desktop: splash unavailable ({e})"),
+            Err(e) => crate::diag::warn_prefixed(&format!("splash unavailable ({e})")),
         }
     }
 
@@ -577,7 +606,7 @@ pub fn run_app(
                     if !pads.iter().any(|p| p.id() == id) {
                         match ctx.open_gamepad(id) {
                             Ok(p) => pads.push(p),
-                            Err(e) => eprintln!("gba-desktop: {e}"),
+                            Err(e) => crate::diag::warn_prefixed(&e),
                         }
                     }
                 }
@@ -586,7 +615,7 @@ pub fn run_app(
                     if !ctx.is_gamepad(id) && !joys.iter().any(|j| j.id() == id) {
                         match ctx.open_joystick(id) {
                             Ok(j) => joys.push(j),
-                            Err(e) => eprintln!("gba-desktop: {e}"),
+                            Err(e) => crate::diag::warn_prefixed(&e),
                         }
                     }
                 }
@@ -596,7 +625,7 @@ pub fn run_app(
                     scancode: sc,
                     repeat,
                 } => {
-                    if menu.open && menu.remap.is_some_and(|r| !r.pad) && sc != scancode::ESCAPE {
+                    if menu.open && menu.remap.is_some_and(|r| !r.pad) && captures_key(sc) {
                         // Ignore auto-repeat of the key that started the remap.
                         if !repeat && let Some(s) = menu.bind(sdl::scancode_name(sc), false) {
                             effect = Effect::Settings(s);
@@ -616,10 +645,13 @@ pub fn run_app(
                             scancode::LEFT => Some(Nav::Left),
                             scancode::RIGHT => Some(Nav::Right),
                             scancode::RETURN | scancode::SPACE | scancode::Z => Some(Nav::Confirm),
-                            scancode::ESCAPE | scancode::BACKSPACE | scancode::X => Some(Nav::Back),
+                            scancode::ESCAPE
+                            | scancode::BACKSPACE
+                            | scancode::X
+                            | scancode::AC_BACK => Some(Nav::Back),
                             _ => None,
                         });
-                    } else if (sc == scancode::ESCAPE || sc == scancode::F1) && !repeat {
+                    } else if opens_menu(sc) && !repeat {
                         effect = Effect::OpenMenu(Page::Main);
                     }
                 }
@@ -666,18 +698,55 @@ pub fn run_app(
                     touch_seen = true;
                     match video.window_to_logical(x, y) {
                         Some(p) => {
-                            fingers.insert(finger, p);
+                            if menu.open {
+                                // The open menu is driven by the same pad the
+                                // game uses (TOUCH-68-02): no on-screen pad,
+                                // no way past the first row on a phone. With
+                                // `touch_controls = off` the pad is gone and
+                                // so is touch navigation; the back button and
+                                // physical input keep working (SPEC-068).
+                                if touch_controls_visible(
+                                    current.input.touch_controls,
+                                    has_touchscreen,
+                                    touch_seen,
+                                ) {
+                                    nav.extend(nav_pad.press(finger, p.0, p.1));
+                                }
+                            } else {
+                                long_press.press(finger, p.0, p.1, Instant::now());
+                            }
+                            // A press consumed by the menu never becomes
+                            // gameplay input: the tap that dismisses the menu
+                            // would otherwise inject its button into the guest
+                            // before the release arrives (TOUCH-68-02).
+                            fingers.down(menu.open, finger, p.0, p.1);
                         }
                         None => {
-                            fingers.remove(&finger);
+                            fingers.up(finger);
+                            long_press.release(finger);
+                            nav_pad.release(finger);
                         }
                     }
                 }
+                // Motion only updates the position; it never starts a press.
+                Event::FingerMotion { finger, x, y } => {
+                    if let Some(p) = video.window_to_logical(x, y) {
+                        fingers.move_to(finger, p.0, p.1);
+                        long_press.moved(finger, p.0, p.1);
+                    }
+                }
                 Event::FingerUp { finger } => {
-                    fingers.remove(&finger);
+                    fingers.up(finger);
+                    long_press.release(finger);
+                    nav_pad.release(finger);
                 }
                 Event::MouseDown { .. } | Event::Other => {}
             }
+        }
+        // A long press on free screen area opens the menu. Polled once per
+        // frame so the threshold does not depend on event batching.
+        if !menu.open && long_press.poll(Instant::now()) {
+            effect = Effect::OpenMenu(Page::Main);
         }
         // Menu bar selections (macOS) and refresh of its check marks.
         if let Some(id) = ctxmenu::take_selected() {
@@ -717,13 +786,18 @@ pub fn run_app(
                 ));
                 current = s;
             }
-            Effect::OpenMenu(page) => menu.open_at(page, &current),
+            Effect::OpenMenu(page) => {
+                // Any route that opens the menu consumes a pending gesture.
+                long_press.cancel();
+                nav_pad.cancel();
+                menu.open_at(page, &current);
+            }
             Effect::TogglePause => paused = !paused,
             Effect::OpenParty => {
                 let msg = match open_companion("gba-party", &[]) {
                     Ok(()) => "Party aberta".to_owned(),
                     Err(e) => {
-                        eprintln!("gba-desktop: {e}");
+                        crate::diag::warn_prefixed(&e);
                         "gba-party nao encontrado".to_owned()
                     }
                 };
@@ -733,7 +807,7 @@ pub fn run_app(
                 let msg = match open_external_settings(settings_path.as_deref()) {
                     Ok(()) => "Janela de configuracoes aberta".to_owned(),
                     Err(e) => {
-                        eprintln!("gba-desktop: {e}");
+                        crate::diag::warn_prefixed(&e);
                         "gba-settings nao encontrado".to_owned()
                     }
                 };
@@ -755,7 +829,7 @@ pub fn run_app(
                     Ok(false) if o.save.is_none() => "Sem arquivo de save (--save)".to_owned(),
                     Ok(false) => "Nada novo para gravar".to_owned(),
                     Err(e) => {
-                        eprintln!("gba-desktop: {e}");
+                        crate::diag::warn_prefixed(&e);
                         "Falha ao gravar o save".to_owned()
                     }
                 };
@@ -788,12 +862,14 @@ pub fn run_app(
                             }
                             status = Some(("Configuracoes recarregadas".into(), Instant::now()));
                         }
-                        Some(w) => eprintln!("gba-desktop: {w}"),
+                        Some(w) => crate::diag::warn_prefixed(&w),
                     }
                 }
             }
         }
 
+        let show_touch =
+            touch_controls_visible(current.input.touch_controls, has_touchscreen, touch_seen);
         let suspended = menu.open || paused;
         if suspended != was_suspended
             && let Some(a) = audio.as_mut()
@@ -813,9 +889,21 @@ pub fn run_app(
                 }
             });
             let msg = status.as_ref().map(|(m, _)| m.clone());
+            // With the menu open the pad is the menu's own navigation
+            // (TOUCH-68-02), so it stays visible as a guide behind the rows.
+            let ghost = open && show_touch;
+            let held = nav_pad.pressed();
             video.present_with(&pixels, |p| {
                 if open {
-                    draw_menu(p, title, &rows, cursor, remap_hint, msg.as_deref());
+                    draw_menu(
+                        p,
+                        title,
+                        &rows,
+                        cursor,
+                        remap_hint,
+                        msg.as_deref(),
+                        ghost.then_some(held),
+                    );
                 } else {
                     p.fill(0.0, 0.0, 240.0, 14.0, [0, 0, 0, 180]);
                     p.text(4.0, 3.0, "PAUSADO - botao direito: menu", [255, 255, 255]);
@@ -861,16 +949,9 @@ pub fn run_app(
             .collect();
         let fast_forward = ctx.key_down(scancode::TAB);
         let gpio_mask = gpio.as_ref().map_or(0, GpioInput::mask);
-        let show_touch = match current.input.touch_controls {
-            TouchMode::On => true,
-            TouchMode::Off => false,
-            TouchMode::Auto => has_touchscreen || touch_seen,
-        };
-        let touch_mask = if show_touch {
-            touch::mask(fingers.values().copied())
-        } else {
-            0
-        };
+        let show_touch =
+            touch_controls_visible(current.input.touch_controls, has_touchscreen, touch_seen);
+        let touch_mask = if show_touch { fingers.mask() } else { 0 };
         gba.set_keys(bindings.mask_all(
             |sc| ctx.key_down(sc),
             &states,
@@ -904,7 +985,7 @@ pub fn run_app(
             if queued > max_queued {
                 report.audio_overruns += 1; // drop this frame's samples
             } else if let Err(e) = a.put(&samples) {
-                eprintln!("gba-desktop: audio disabled ({e})");
+                crate::diag::warn_prefixed(&format!("audio disabled ({e})"));
                 audio = None;
             }
         }
@@ -938,7 +1019,7 @@ pub fn run_app(
             match persist_save(&mut gba, o.save.as_deref()) {
                 Ok(true) => report.saves += 1,
                 Ok(false) => {}
-                Err(e) => eprintln!("gba-desktop: {e}"),
+                Err(e) => crate::diag::warn_prefixed(&e),
             }
         }
 
@@ -994,9 +1075,18 @@ fn draw_menu(
     cursor: usize,
     remap_hint: Option<&str>,
     status: Option<&str>,
+    nav_pad: Option<u16>,
 ) {
     p.fill(0.0, 0.0, 240.0, 160.0, [0, 0, 24, 200]);
-    p.text(6.0, 4.0, title, [255, 220, 120]);
+    // Behind the rows, not on top of them: the pad only says where the
+    // navigation targets are.
+    if let Some(pressed) = nav_pad {
+        draw_touch_ghost(p, pressed);
+    }
+    // Centred: on a touch screen the pad is drawn behind the menu, and its
+    // shoulder buttons occupy the left and right ends of this band.
+    let title_x = (240.0 - 8.0 * title.len() as f32) / 2.0;
+    p.text(title_x, 4.0, title, [255, 220, 120]);
     const VISIBLE: usize = 15;
     let start = cursor.saturating_sub(VISIBLE - 1);
     for (i, row) in rows.iter().enumerate().skip(start).take(VISIBLE) {
@@ -1041,5 +1131,97 @@ fn draw_touch(p: &mut sdl::Painter<'_>, pressed: u16) {
         p.fill(x, y, w, h, [255, 255, 255, alpha(on)]);
         let tx = x + (w - 8.0 * b.label.len() as f32) / 2.0;
         p.text(tx, y + (h - 8.0) / 2.0, b.label, [20, 20, 40]);
+    }
+}
+
+/// The pad behind the open menu: same geometry, outlined instead of filled.
+///
+/// The menu reads it as navigation (SPEC-068 TOUCH-68-02), so the targets have
+/// to be visible. A filled pad would paint over the rows — the Controls page
+/// prints values on the right, exactly where A and B sit — so the ghost is an
+/// outline plus a translucent tint that only marks the hit area. Labels stay,
+/// dim, because "A confirms, B goes back" is not guessable from a blank
+/// circle; the pressed control solidifies to confirm the tap landed.
+fn draw_touch_ghost(p: &mut sdl::Painter<'_>, pressed: u16) {
+    use gba_core::keys;
+    let ghost = |on: bool| {
+        if on {
+            [255, 255, 255, 90]
+        } else {
+            [255, 255, 255, 0]
+        }
+    };
+    let edge = |on: bool| {
+        if on {
+            [255, 255, 255, 240]
+        } else {
+            [130, 200, 255, 190]
+        }
+    };
+    let (cx, cy, r) = touch::DPAD;
+    let arm = r * 0.55;
+    for (key, x, y) in [
+        (keys::UP, cx - arm / 2.0, cy - r),
+        (keys::DOWN, cx - arm / 2.0, cy + r - arm),
+        (keys::LEFT, cx - r, cy - arm / 2.0),
+        (keys::RIGHT, cx + r - arm, cy - arm / 2.0),
+    ] {
+        let on = pressed & key != 0;
+        p.fill(x, y, arm, arm, ghost(on));
+        p.outline(x, y, arm, arm, edge(on));
+    }
+    for b in &touch::BUTTONS {
+        let (x, y, w, h) = match b.shape {
+            touch::Shape::Circle { x, y, r } => (x - r, y - r, r * 2.0, r * 2.0),
+            touch::Shape::Rect { x, y, w, h } => (x, y, w, h),
+        };
+        let on = pressed & b.key != 0;
+        p.fill(x, y, w, h, ghost(on));
+        p.outline(x, y, w, h, edge(on));
+        let tx = x + (w - 8.0 * b.label.len() as f32) / 2.0;
+        p.text(tx, y + (h - 8.0) / 2.0, b.label, [190, 190, 215]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// On Android the back button is the only way to reach the menu: SDL
+    /// delivers it as `SDL_SCANCODE_AC_BACK` once the trap hint is installed.
+    #[test]
+    fn android_back_opens_the_menu() {
+        assert!(opens_menu(scancode::AC_BACK));
+        // Desktop routes keep working.
+        assert!(opens_menu(scancode::ESCAPE) && opens_menu(scancode::F1));
+        assert!(
+            !opens_menu(scancode::Z),
+            "a play key must not open the menu"
+        );
+    }
+
+    /// Capturing the back button as a game binding would leave the menu
+    /// unreachable on a phone, so it behaves like Esc during a remap.
+    #[test]
+    fn back_button_is_not_remappable() {
+        assert!(!captures_key(scancode::AC_BACK));
+        assert!(!captures_key(scancode::ESCAPE));
+        assert!(captures_key(scancode::Z), "ordinary keys are capturable");
+        assert!(captures_key(scancode::RETURN));
+    }
+
+    /// `off` removes the pad and with it all touch navigation (TOUCH-68-02):
+    /// the menu stays reachable by long press and the back button, but there
+    /// is no touch target left for the arrows or `A`.
+    #[test]
+    fn touch_controls_off_disables_touch_navigation() {
+        assert!(
+            !touch_controls_visible(TouchMode::Off, true, true),
+            "off wins even with a touch screen"
+        );
+        assert!(touch_controls_visible(TouchMode::On, false, false));
+        assert!(touch_controls_visible(TouchMode::Auto, true, false));
+        assert!(touch_controls_visible(TouchMode::Auto, false, true));
+        assert!(!touch_controls_visible(TouchMode::Auto, false, false));
     }
 }

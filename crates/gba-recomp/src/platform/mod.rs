@@ -150,23 +150,30 @@ pub fn default_runtime(spec: &TargetSpec) -> Result<PathBuf, String> {
     }
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("gba-recomp has no parent directory")?;
-    let mut candidates = vec![
-        dir.join("..")
-            .join("..")
-            .join(&spec.triple)
-            .join("release")
-            .join(name),
-    ];
-    if *spec == TargetSpec::host() {
-        candidates.insert(0, dir.join(name));
-        candidates.push(dir.join("..").join(name));
-    }
+    let candidates = runtime_candidates(dir, spec, name);
     candidates.into_iter().find(|p| p.is_file()).ok_or_else(|| {
         format!(
             "runtime library {name} for {} not found; build it with `cargo build --release -p gba-native-rt --target {}` or pass --runtime-lib",
             spec.triple, spec.triple
         )
     })
+}
+
+/// Where [`default_runtime`] looks for the library, in order.
+///
+/// `dir` is the directory holding the `gba-recomp` binary: `target/release`
+/// for a normal build. Cargo puts a cross-compiled staticlib in
+/// `target/<triple>/release`, which is *one* level above that binary, not
+/// two: walking up twice looked in `<repo>/<triple>/release` and so always
+/// missed. Every workflow and `scripts/ci/package.sh` pass `--runtime-lib`
+/// explicitly, which is what kept the mistake hidden.
+fn runtime_candidates(dir: &Path, spec: &TargetSpec, name: &str) -> Vec<PathBuf> {
+    let mut candidates = vec![dir.join("..").join(&spec.triple).join("release").join(name)];
+    if *spec == TargetSpec::host() {
+        candidates.insert(0, dir.join(name));
+        candidates.push(dir.join("..").join(name));
+    }
+    candidates
 }
 
 /// Default SDL3 location for `spec`: `SDL3_LIB_DIR` or the usual install
@@ -189,22 +196,69 @@ pub fn default_sdl_dir(spec: &TargetSpec) -> PathBuf {
     match Platform::of(spec) {
         Platform::MacOs => PathBuf::from("/opt/homebrew/lib"),
         Platform::Linux => {
-            let multiarch = if spec.triple.starts_with("aarch64") {
-                "aarch64-linux-gnu"
-            } else if spec.triple.starts_with("armv7") {
-                "arm-linux-gnueabihf"
-            } else {
-                "x86_64-linux-gnu"
-            };
-            let local = PathBuf::from("/usr/local/lib");
-            if local.join("libSDL3.so.0").exists() {
-                local
-            } else {
-                PathBuf::from(format!("/usr/lib/{multiarch}"))
-            }
+            // Probe the layouts in use rather than assuming one. Debian and
+            // Ubuntu use a multiarch directory; Arch, Fedora and most others
+            // install straight into /usr/lib. The order and the host-only
+            // `pkg-config` rule live in [`sdl_candidates`].
+            let candidates = sdl_candidates(spec);
+            candidates
+                .into_iter()
+                .find(|dir| dir.join("libSDL3.so.0").exists())
+                // Nothing present: keep the previous default so the error
+                // message still names a conventional location.
+                .unwrap_or_else(|| PathBuf::from(format!("/usr/lib/{}", linux_multiarch(spec))))
         }
         _ => PathBuf::from("sdl3"),
     }
+}
+
+/// The Debian/Ubuntu multiarch directory for `spec`.
+fn linux_multiarch(spec: &TargetSpec) -> &'static str {
+    if spec.triple.starts_with("aarch64") {
+        "aarch64-linux-gnu"
+    } else if spec.triple.starts_with("armv7") {
+        "arm-linux-gnueabihf"
+    } else {
+        "x86_64-linux-gnu"
+    }
+}
+
+/// Where [`default_sdl_dir`] looks for the Linux library, in order.
+///
+/// `pkg-config` is consulted only when `spec` is the host: it answers with the
+/// host's `libdir` even when `spec` is a cross target, and packaging that
+/// host-architecture `libSDL3.so.0` into a foreign-arch bundle breaks at load
+/// time — worse than the loud "not found" that tells the user to pass
+/// `--sdl-dir`.
+fn sdl_candidates(spec: &TargetSpec) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if *spec == TargetSpec::host()
+        && let Some(dir) = pkg_config_libdir("sdl3")
+    {
+        candidates.push(dir);
+    }
+    let multiarch = linux_multiarch(spec);
+    candidates.push(PathBuf::from("/usr/local/lib"));
+    candidates.push(PathBuf::from(format!("/usr/lib/{multiarch}")));
+    candidates.push(PathBuf::from("/usr/lib64"));
+    candidates.push(PathBuf::from("/usr/lib"));
+    candidates
+}
+
+/// `pkg-config --variable=libdir <package>`, when the tool and `.pc` file
+/// exist. Used to find SDL3 on distributions that place it somewhere other
+/// than the Debian multiarch directory.
+fn pkg_config_libdir(package: &str) -> Option<PathBuf> {
+    let output = Command::new("pkg-config")
+        .args(["--variable=libdir", package])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8(output.stdout).ok()?;
+    let dir = PathBuf::from(dir.trim());
+    dir.is_absolute().then_some(dir)
 }
 
 /// A tool from the pinned LLVM (clang, lld, llvm-otool…).
@@ -231,4 +285,117 @@ pub fn run(command: &mut Command, what: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    /// The Linux default used to assume Debian's multiarch directory, which
+    /// broke `bundle` on Arch and Fedora where SDL3 lives in `/usr/lib`. When
+    /// SDL3 is installed on this host, the resolver MUST
+    /// return the directory that actually contains it — a conventional-looking
+    /// path is not good enough, since that is what failed before.
+    #[test]
+    fn linux_sdl_dir_contains_sdl3_when_installed() {
+        let spec = TargetSpec::host();
+        if Platform::of(&spec) != Platform::Linux {
+            return; // other platforms have their own defaults
+        }
+        if !sdl_candidates(&spec)
+            .iter()
+            .any(|d| d.join("libSDL3.so.0").exists())
+        {
+            return; // nothing to find; the fallback is all we can offer
+        }
+        let dir = default_sdl_dir(&spec);
+        assert!(
+            dir.join("libSDL3.so.0").exists(),
+            "SDL3 is installed but default_sdl_dir returned {dir:?}, which has no libSDL3.so.0"
+        );
+    }
+
+    /// `pkg-config` answers with the host's libdir even for a cross target:
+    /// trusting it would package a host-architecture `libSDL3.so.0` into a
+    /// foreign-arch bundle, where it breaks at load time instead of failing
+    /// the lookup loudly. Cross lookups stick to the layout guesses.
+    #[test]
+    fn cross_sdl_candidates_never_use_host_pkgconfig() {
+        let spec = TargetSpec::for_triple("aarch64-unknown-linux-gnu").unwrap();
+        let expected = [
+            "/usr/local/lib",
+            "/usr/lib/aarch64-linux-gnu",
+            "/usr/lib64",
+            "/usr/lib",
+        ];
+        assert_eq!(
+            sdl_candidates(&spec),
+            expected.iter().map(PathBuf::from).collect::<Vec<_>>()
+        );
+    }
+
+    /// A cross-compiled runtime lives in `target/<triple>/release`, one level
+    /// above `target/release/gba-recomp`. The resolver used to walk up twice,
+    /// so `bundle --target aarch64-linux-android` without `--runtime-lib`
+    /// reported the library as missing even when it had been built. Every
+    /// workflow passes `--runtime-lib`, which is why CI never noticed.
+    #[test]
+    fn cross_runtime_is_found_one_level_above_the_binary() {
+        let base = env::temp_dir().join(format!("gba-rt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let triple = "aarch64-linux-android";
+        let spec = TargetSpec::for_triple(triple).unwrap();
+        let lib = base
+            .join("target")
+            .join(triple)
+            .join("release")
+            .join("libgba_native_rt.a");
+        fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        fs::write(&lib, b"stub").unwrap();
+        // `dir` is where the binary lives, as in a real `target/release`.
+        let dir = base.join("target").join("release");
+        fs::create_dir_all(&dir).unwrap();
+
+        let candidates = runtime_candidates(&dir, &spec, "libgba_native_rt.a");
+        let found = candidates
+            .iter()
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| panic!("no candidate exists; tried {candidates:?}"));
+        assert_eq!(
+            fs::canonicalize(found).unwrap(),
+            fs::canonicalize(&lib).unwrap(),
+            "resolved to {found:?} instead of {lib:?}"
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The host target keeps its own lookup order: next to the binary first,
+    /// because `cargo build` copies the staticlib there.
+    #[test]
+    fn host_runtime_is_found_next_to_the_binary() {
+        let base = env::temp_dir().join(format!("gba-rt-host-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dir = base.join("target").join("release");
+        fs::create_dir_all(&dir).unwrap();
+        let name = Platform::of(&TargetSpec::host()).runtime_lib_name();
+        fs::write(dir.join(name), b"stub").unwrap();
+
+        let candidates = runtime_candidates(&dir, &TargetSpec::host(), name);
+        assert_eq!(candidates.first(), Some(&dir.join(name)));
+        assert!(candidates[0].is_file());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Every candidate path the resolver tries must be absolute, so a wrong
+    /// guess can never resolve relative to the current directory.
+    #[test]
+    fn pkg_config_libdir_is_absolute_or_none() {
+        if let Some(dir) = super::pkg_config_libdir("sdl3") {
+            assert!(dir.is_absolute(), "{dir:?}");
+        }
+        // A package that cannot exist must yield None, not a bogus path.
+        assert_eq!(super::pkg_config_libdir("no-such-package-xyz"), None);
+    }
 }
