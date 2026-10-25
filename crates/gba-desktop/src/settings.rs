@@ -6,6 +6,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use gba_i18n::Lang;
+
 pub const VERSION: u32 = 1;
 
 /// GBA buttons in KEYINPUT bit order.
@@ -13,10 +15,30 @@ pub const BUTTONS: [&str; 10] = [
     "a", "b", "select", "start", "right", "left", "up", "down", "r", "l",
 ];
 
-/// Display names for the in-window menu (ASCII: the SDL debug font).
-pub const BUTTON_LABELS: [&str; 10] = [
-    "A", "B", "Select", "Start", "Direita", "Esquerda", "Cima", "Baixo", "R", "L",
+/// Translation keys for the display names, in `BUTTONS` order. The labels are
+/// translated rather than constant because they are shown inside menu rows
+/// that are themselves localized ("Direita teclado" / "Right keyboard") and
+/// they are also passed as the `button` argument of those rows
+/// (SPEC-069 L10N-69-03).
+pub const BUTTON_LABEL_KEYS: [&str; 10] = [
+    "button.a",
+    "button.b",
+    "button.select",
+    "button.start",
+    "button.right",
+    "button.left",
+    "button.up",
+    "button.down",
+    "button.r",
+    "button.l",
 ];
+
+/// Display name of button `i` in the current language.
+pub fn button_label(i: usize) -> String {
+    BUTTON_LABEL_KEYS
+        .get(i)
+        .map_or_else(String::new, |k| gba_i18n::translate(k))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Filter {
@@ -129,6 +151,8 @@ pub struct Settings {
     pub audio: Audio,
     pub input: Input,
     pub gpio: Gpio,
+    /// Interface language (SPEC-069 L10N-69-01). Host-only.
+    pub language: Lang,
 }
 
 fn strings(list: &[&str]) -> Vec<String> {
@@ -198,6 +222,7 @@ impl Default for Settings {
             },
             input: Input::default(),
             gpio: Gpio::default(),
+            language: Lang::default(),
         }
     }
 }
@@ -372,6 +397,17 @@ impl Settings {
         };
         match (section, key) {
             ("", "version") => *version = Some(int(&value, 0, 1_000)? as u32),
+            // Ausente = padrão `pt-BR`, então arquivos antigos seguem válidos
+            // sem trocar a `version` (L10N-69-02).
+            ("", "language") => match value {
+                Value::Str(s) => {
+                    self.language = Lang::from_tag(&s).ok_or_else(|| {
+                        let known: Vec<&str> = Lang::all().iter().map(|l| l.tag()).collect();
+                        format!("`language` must be one of {known:?}, got `{s}`")
+                    })?
+                }
+                _ => return Err("`language` must be a string tag".into()),
+            },
             ("video", "scale") => {
                 self.video.scale = int(&value, SCALE_RANGE.0.into(), SCALE_RANGE.1.into())? as u8
             }
@@ -473,7 +509,12 @@ impl Settings {
         Ok(())
     }
 
-    pub fn serialize(&self) -> String {
+    /// The file text for this snapshot. `explicit_language` writes the
+    /// top-level `language` key; without it the key is omitted, because its
+    /// absence means "follow the system language" (L10N-69-04) and an
+    /// unrelated save must not pin the detected language — or resurrect a
+    /// key the user deleted.
+    pub fn serialize(&self, explicit_language: bool) -> String {
         let mut o = String::new();
         let list = |l: &[String]| {
             let items: Vec<String> = l
@@ -488,7 +529,10 @@ impl Settings {
             o,
             "# gba-recomp host settings (SPEC-063). Presentation only: never changes the game."
         );
-        let _ = writeln!(o, "version = {VERSION}\n");
+        let _ = writeln!(o, "version = {VERSION}");
+        if explicit_language {
+            let _ = writeln!(o, "language = \"{}\"\n", self.language.tag());
+        }
         let _ = writeln!(o, "[video]");
         let _ = writeln!(o, "scale = {}", v.scale);
         let _ = writeln!(o, "fullscreen = {}", v.fullscreen);
@@ -549,6 +593,34 @@ pub struct Loaded {
     pub invalid_on_disk: bool,
 }
 
+/// The language a frontend must start in, and whether it came from an
+/// explicit choice rather than from the system (SPEC-069 L10N-69-04).
+///
+/// One rule for all three frontends: a `language` line in `settings.toml` is
+/// an explicit choice and wins over the OS, forever; without it the OS
+/// language decides, and keeps deciding when it later changes. `system` is
+/// the tag list from `sdl::preferred_locales()`.
+pub fn initial_language(path: Option<&Path>, loaded: &Settings, system: &[String]) -> (Lang, bool) {
+    let explicit = path
+        .and_then(|p| fs::read_to_string(p).ok())
+        .is_some_and(|text| text.lines().any(|l| l.trim_start().starts_with("language")));
+    if explicit {
+        (loaded.language, true)
+    } else {
+        (gba_i18n::detect_from(system).unwrap_or_default(), false)
+    }
+}
+
+/// Modification time of the settings file, or `None` when it does not exist.
+///
+/// Both frontends poll this to notice a change written by the other one; a
+/// single helper keeps "did the file change" meaning the same thing on both
+/// sides (SPEC-069 L10N-69-03, EXT-64-02).
+pub fn modified(path: Option<&Path>) -> Option<std::time::SystemTime> {
+    path.and_then(|p| fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+}
+
 pub fn load(path: &Path) -> Loaded {
     match fs::read_to_string(path) {
         Ok(text) => match Settings::parse(&text) {
@@ -584,7 +656,12 @@ pub fn load(path: &Path) -> Loaded {
 
 /// Persist atomically. An invalid file is first preserved as
 /// `settings.toml.invalid` (UI-07).
-pub fn save(path: &Path, settings: &Settings, invalid_on_disk: bool) -> Result<(), String> {
+pub fn save(
+    path: &Path,
+    settings: &Settings,
+    invalid_on_disk: bool,
+    explicit_language: bool,
+) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
@@ -597,10 +674,57 @@ pub fn save(path: &Path, settings: &Settings, invalid_on_disk: bool) -> Result<(
             )
         })?;
     }
+    write_atomic(path, &settings.serialize(explicit_language))
+}
+
+/// Writes just the top-level `language` key, atomically and leaving the rest
+/// of the file untouched (SPEC-069 L10N-69-03): a language pick must not also
+/// persist whatever else a draft happens to hold — nor rewrite a file the
+/// user hand-edited.
+pub fn save_language(path: &Path, lang: Lang) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let is_language_key = |line: &str| {
+        line.strip_prefix("language")
+            .is_some_and(|r| r.trim_start().starts_with('='))
+    };
+    let mut out = String::new();
+    let mut replaced = false;
+    let mut in_section = false;
+    let mut version_at: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            in_section = true;
+        }
+        if !in_section && is_language_key(trimmed) {
+            if !replaced {
+                out.push_str(&format!("language = \"{}\"\n", lang.tag()));
+                replaced = true;
+            }
+            continue;
+        }
+        if !in_section && trimmed.starts_with("version") {
+            version_at = Some(out.len());
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !replaced {
+        // Where `Settings::serialize` puts it: right after `version`.
+        let at = version_at.map_or(0, |at| out[at..].find('\n').map_or(at, |end| at + end + 1));
+        out.insert_str(at, &format!("language = \"{}\"\n", lang.tag()));
+    }
+    write_atomic(path, &out)
+}
+
+fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     let tmp = path.with_extension("toml.tmp");
     let mut f =
         fs::File::create(&tmp).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    f.write_all(settings.serialize().as_bytes())
+    f.write_all(text.as_bytes())
         .and_then(|()| f.sync_all())
         .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     drop(f);
@@ -614,7 +738,7 @@ mod tests {
     #[test]
     fn defaults_round_trip() {
         let s = Settings::default();
-        assert_eq!(Settings::parse(&s.serialize()).unwrap(), s);
+        assert_eq!(Settings::parse(&s.serialize(true)).unwrap(), s);
     }
 
     #[test]
@@ -635,7 +759,7 @@ mod tests {
         s.gpio.debounce_ms = 25;
         s.gpio.lines[0] = Some(17);
         s.gpio.lines[9] = Some(26);
-        assert_eq!(Settings::parse(&s.serialize()).unwrap(), s);
+        assert_eq!(Settings::parse(&s.serialize(true)).unwrap(), s);
     }
 
     #[test]
@@ -666,6 +790,130 @@ mod tests {
     }
 
     #[test]
+    fn language_defaults_to_pt_br_without_a_version_bump() {
+        // Arquivo anterior à localização: sem `language`, versão 1 (L10N-69-02).
+        let s = Settings::parse("version = 1\n[audio]\nmute = true\n").unwrap();
+        assert_eq!(s.language, Lang::PtBr);
+    }
+
+    #[test]
+    fn language_round_trips() {
+        let s = Settings::default();
+        assert_eq!(s.language, Lang::PtBr);
+        let text = s.serialize(true);
+        assert!(text.contains("language = \"pt-BR\""), "{text}");
+        assert_eq!(Settings::parse(&text).unwrap().language, Lang::PtBr);
+    }
+
+    #[test]
+    fn unknown_language_is_rejected_with_a_clear_message() {
+        let e = Settings::parse("version = 1\nlanguage = \"ja-JP\"\n").unwrap_err();
+        assert!(e.contains("language"), "{e}");
+        assert!(e.contains("pt-BR"), "should list what is available: {e}");
+        // Uma tag não-string também é erro de formato.
+        assert!(Settings::parse("version = 1\nlanguage = 3\n").is_err());
+    }
+
+    #[test]
+    fn language_accepts_posix_forms_on_read() {
+        // Um arquivo editado à mão com `pt_BR` continua sendo aceito.
+        let s = Settings::parse("version = 1\nlanguage = \"pt_BR\"\n").unwrap();
+        assert_eq!(s.language, Lang::PtBr);
+        let s = Settings::parse("version = 1\nlanguage = \"en_US\"\n").unwrap();
+        assert_eq!(s.language, Lang::EnUs);
+    }
+
+    #[test]
+    fn english_round_trips_through_the_file() {
+        let s = Settings::parse("version = 1\nlanguage = \"en-US\"\n").unwrap();
+        assert_eq!(s.language, Lang::EnUs);
+        let text = s.serialize(true);
+        assert!(text.contains("language = \"en-US\""), "{text}");
+        assert_eq!(Settings::parse(&text).unwrap().language, Lang::EnUs);
+    }
+
+    /// A save that is not a language action must not write the key
+    /// (L10N-69-04): its absence is what makes the file follow the system
+    /// language, and writing it once would pin the detected language forever.
+    #[test]
+    fn the_language_key_is_written_only_for_an_explicit_choice() {
+        let s = Settings::default();
+        let implicit = s.serialize(false);
+        assert!(
+            !implicit.contains("language"),
+            "no explicit choice, no key: {implicit}"
+        );
+        assert_eq!(Settings::parse(&implicit).unwrap(), s);
+        assert!(s.serialize(true).contains("language = \"pt-BR\""));
+    }
+
+    /// The language picker writes only the `language` key: no other pending
+    /// edit is persisted behind the user's back (L10N-69-03).
+    #[test]
+    fn save_language_rewrites_only_the_top_level_key() {
+        let dir = std::env::temp_dir().join(format!("gba-savelang-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.toml");
+        fs::write(
+            &path,
+            "version = 1\nlanguage = \"pt-BR\"\n[audio]\nvolume = 50\nlanguage = 7\n",
+        )
+        .unwrap();
+        save_language(&path, Lang::EnUs).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("language = \"en-US\""), "{text}");
+        assert!(!text.contains("pt-BR"), "the old key is gone");
+        assert!(text.contains("volume = 50"), "the rest is untouched");
+        assert!(
+            text.contains("language = 7"),
+            "keys inside sections are not ours"
+        );
+        assert_eq!(text.matches("language").count(), 2, "no duplicate key");
+        // No parse check: the fixture is a hand-edited file on purpose, and a
+        // surgical write must work even when the file is not parseable.
+
+        // Without any key, it lands after `version`, where serialize puts it.
+        fs::write(&path, "version = 1\n[audio]\nvolume = 50\n").unwrap();
+        save_language(&path, Lang::EnUs).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("version = 1\nlanguage = \"en-US\"\n"),
+            "{text}"
+        );
+        assert_eq!(Settings::parse(&text).unwrap().language, Lang::EnUs);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The rule all three frontends share (SPEC-069 L10N-69-04): a `language`
+    /// line is an explicit choice and outranks the OS, forever.
+    #[test]
+    fn explicit_language_beats_the_system() {
+        let dir = std::env::temp_dir().join(format!("gba-lang-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = dir.join("explicit.toml");
+        std::fs::write(&saved, "version = 1\nlanguage = \"pt-BR\"\n").unwrap();
+        let (lang, chosen) =
+            initial_language(Some(&saved), &Settings::default(), &["en-US".to_owned()]);
+        assert_eq!(lang, Lang::PtBr, "the saved choice wins over the OS");
+        assert!(chosen);
+
+        let fresh = dir.join("fresh.toml");
+        std::fs::write(&fresh, "version = 1\n").unwrap();
+        let (lang, chosen) =
+            initial_language(Some(&fresh), &Settings::default(), &["en-US".to_owned()]);
+        assert_eq!(lang, Lang::EnUs, "no choice means follow the OS");
+        assert!(!chosen, "following the OS is not an explicit choice");
+
+        // With no file at all, the system decides — including the POSIX
+        // fallback inside `detect_from` — and that is not an explicit choice.
+        let system = ["ja-JP".to_owned()];
+        let (lang, chosen) = initial_language(None, &Settings::default(), &system);
+        assert_eq!(lang, gba_i18n::detect_from(&system).unwrap_or_default());
+        assert!(!chosen);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn partial_file_keeps_defaults_and_comments_are_ignored() {
         let s = Settings::parse("version = 1 # c\n[audio]\nmute = true # m\n").unwrap();
         assert!(s.audio.mute);
@@ -681,7 +929,7 @@ mod tests {
         let loaded = load(&path);
         assert!(loaded.warning.is_some() && loaded.invalid_on_disk);
         assert_eq!(fs::read_to_string(&path).unwrap(), "garbage");
-        save(&path, &loaded.settings, true).unwrap();
+        save(&path, &loaded.settings, true, true).unwrap();
         assert_eq!(
             fs::read_to_string(path.with_extension("toml.invalid")).unwrap(),
             "garbage"
